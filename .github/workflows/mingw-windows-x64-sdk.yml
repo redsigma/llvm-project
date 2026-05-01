@@ -1,0 +1,354 @@
+name: Mingw Windows x64 LLVM SDK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-dia-sdk:
+    runs-on: windows-2022
+    env:
+      DIA_BOOTSTRAP_URL: https://aka.ms/vs/17/release/vs_buildtools.exe
+    steps:
+      - name: Locate DIA SDK (preinstalled or install Build Tools)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $bootstrapPath = "$env:TEMP\vs_buildtools.exe"
+          $channelUrl = 'https://aka.ms/vs/17/release/channel'
+          $channelPath = Join-Path $env:GITHUB_WORKSPACE 'ChannelManifest.json'
+          $buildToolsInstallPath = Join-Path $env:ProgramFiles 'Microsoft Visual Studio\2022\BuildTools'
+          $fallbackLayoutPath = Join-Path $env:GITHUB_WORKSPACE 'vs-layout-fallback'
+          $fallbackInstallPath = Join-Path $env:GITHUB_WORKSPACE 'vsbuildtools-fallback'
+
+          $vsInstallArgs = @(
+            '--quiet',
+            '--wait',
+            '--norestart',
+            '--nocache',
+            '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+            '--add', 'Microsoft.VisualStudio.Component.VC.ATL',
+            '--includeRecommended'
+          )
+
+          function Test-DiaRoot([string]$Root) {
+            if (-not $Root) { return $false }
+            $header = Join-Path $Root 'include\dia2.h'
+            $lib = Join-Path $Root 'lib\amd64\diaguids.lib'
+            return (Test-Path $header) -and (Test-Path $lib)
+          }
+
+          function Get-VswherePath {
+            $p1 = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+            if (Test-Path $p1) { return $p1 }
+            $p2 = Join-Path $env:ProgramFiles 'Microsoft Visual Studio\Installer\vswhere.exe'
+            if (Test-Path $p2) { return $p2 }
+            return $null
+          }
+
+          function Get-VsInstallPaths {
+            $results = New-Object System.Collections.Generic.List[string]
+            $vswhere = Get-VswherePath
+            if ($vswhere) {
+              $json = & $vswhere -products * -format json
+              if ($LASTEXITCODE -eq 0 -and $json) {
+                $instances = $json | ConvertFrom-Json
+                foreach ($inst in $instances) {
+                  if ($inst.installationPath) {
+                    $results.Add($inst.installationPath)
+                  }
+                }
+              }
+            }
+            return ($results | Select-Object -Unique)
+          }
+
+          function Get-DiaCandidates([string]$ExtraInstallPath) {
+            $candidates = New-Object System.Collections.Generic.List[string]
+            $candidates.Add((Join-Path $env:ProgramFiles 'Microsoft Visual Studio\2022\BuildTools\DIA SDK'))
+            $candidates.Add((Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\BuildTools\DIA SDK'))
+            $candidates.Add((Join-Path $env:ProgramFiles 'Microsoft Visual Studio\2022\Enterprise\DIA SDK'))
+            $candidates.Add((Join-Path $env:ProgramFiles 'Microsoft Visual Studio\2022\Professional\DIA SDK'))
+            $candidates.Add((Join-Path $env:ProgramFiles 'Microsoft Visual Studio\2022\Community\DIA SDK'))
+
+            if ($ExtraInstallPath) {
+              $candidates.Add((Join-Path $ExtraInstallPath 'DIA SDK'))
+            }
+
+            foreach ($vsPath in Get-VsInstallPaths) {
+              $candidates.Add((Join-Path $vsPath 'DIA SDK'))
+            }
+
+            return ($candidates | Select-Object -Unique)
+          }
+
+          function Write-DiaDiagnostics([string]$Phase, [string]$ExtraInstallPath) {
+            Write-Host "== DIA diagnostics: $Phase =="
+            $vswhere = Get-VswherePath
+            if ($vswhere) {
+              Write-Host "vswhere: $vswhere"
+              & $vswhere -products * -format table
+            } else {
+              Write-Host 'vswhere not found'
+            }
+
+            $candidates = Get-DiaCandidates -ExtraInstallPath $ExtraInstallPath
+            foreach ($root in $candidates) {
+              $hasHeader = Test-Path (Join-Path $root 'include\dia2.h')
+              $hasLib = Test-Path (Join-Path $root 'lib\amd64\diaguids.lib')
+              Write-Host ("candidate={0} header={1} lib={2}" -f $root, $hasHeader, $hasLib)
+            }
+            return $candidates
+          }
+
+          function Resolve-DiaRoot([string]$ExtraInstallPath) {
+            $candidates = Get-DiaCandidates -ExtraInstallPath $ExtraInstallPath
+            foreach ($root in $candidates) {
+              if (Test-DiaRoot $root) {
+                return $root
+              }
+            }
+            return $null
+          }
+
+          function Invoke-VsInstaller([string]$ExePath, [string[]]$Arguments) {
+            $proc = Start-Process -FilePath $ExePath -ArgumentList $Arguments -PassThru -Wait -NoNewWindow
+            if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+              throw "Visual Studio installer failed with exit code $($proc.ExitCode)"
+            }
+            Write-Host "Visual Studio installer exit code: $($proc.ExitCode)"
+          }
+
+          $null = Write-DiaDiagnostics -Phase 'pre-install' -ExtraInstallPath ''
+          $diaRoot = Resolve-DiaRoot -ExtraInstallPath ''
+
+          if (-not $diaRoot) {
+            Write-Host 'DIA SDK not found, installing Build Tools workload from internet...'
+            Invoke-WebRequest -Uri $env:DIA_BOOTSTRAP_URL -OutFile $bootstrapPath
+            $primaryArgs = @('--installPath', $buildToolsInstallPath) + $vsInstallArgs
+            Invoke-VsInstaller -ExePath $bootstrapPath -Arguments $primaryArgs
+            $null = Write-DiaDiagnostics -Phase 'post-primary-install' -ExtraInstallPath $buildToolsInstallPath
+            $diaRoot = Resolve-DiaRoot -ExtraInstallPath $buildToolsInstallPath
+          }
+
+          if (-not $diaRoot) {
+            Write-Host 'Primary Build Tools DIA acquisition failed, starting official Microsoft channel fallback...'
+            New-Item -ItemType Directory -Force -Path $fallbackLayoutPath | Out-Null
+            Invoke-WebRequest -Uri $channelUrl -OutFile $channelPath
+
+            $layoutArgs = @(
+              '--layout', $fallbackLayoutPath,
+              '--lang', 'en-US',
+              '--channelUri', $channelPath,
+              '--installChannelUri', $channelPath
+            ) + $vsInstallArgs
+            Invoke-VsInstaller -ExePath $bootstrapPath -Arguments $layoutArgs
+
+            $fallbackArgs = @(
+              '--noweb',
+              '--installPath', $fallbackInstallPath,
+              '--channelUri', $channelPath,
+              '--installChannelUri', $channelPath
+            ) + $vsInstallArgs
+            $fallbackSetupExe = Join-Path $fallbackLayoutPath 'vs_setup.exe'
+            if (-not (Test-Path $fallbackSetupExe)) {
+              throw "Fallback setup executable not found: $fallbackSetupExe"
+            }
+            Invoke-VsInstaller -ExePath $fallbackSetupExe -Arguments $fallbackArgs
+
+            $null = Write-DiaDiagnostics -Phase 'post-fallback-install' -ExtraInstallPath $fallbackInstallPath
+            $diaRoot = Resolve-DiaRoot -ExtraInstallPath $fallbackInstallPath
+          }
+
+          if (-not $diaRoot) {
+            $searched = (Get-DiaCandidates -ExtraInstallPath $fallbackInstallPath) -join '; '
+            throw "DIA SDK not found after setup. Searched: $searched"
+          }
+
+          Write-Host "Using DIA SDK: $diaRoot"
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dia-payload" | Out-Null
+          Copy-Item -Recurse -Force "$diaRoot" "$env:GITHUB_WORKSPACE\dia-payload\DIA SDK"
+
+      - name: Pack DIA SDK archive
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE\dia-payload\DIA SDK" -DestinationPath "$env:GITHUB_WORKSPACE\archive.zip" -Force
+
+      - name: Upload DIA SDK archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: dia-sdk-archive
+          path: ${{ github.workspace }}/archive.zip
+
+  build-sdk:
+    runs-on: ubuntu-22.04
+    needs: fetch-dia-sdk
+    env:
+      TARGET_TRIPLE: x86_64-w64-mingw32
+      SDK_DIR_NAME: llvm-sdk-mingw-x86_64-windows
+    steps:
+      - name: Checkout LLVM
+        uses: actions/checkout@v6
+
+      - name: Download DIA SDK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dia-sdk-archive
+          path: ${{ github.workspace }}/external/dia
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            lld \
+            cmake \
+            ninja-build \
+            mingw-w64 \
+            zip \
+            unzip \
+            p7zip-full \
+            python3
+
+      - name: Prepare DIA SDK from downloaded archive
+        run: |
+          set -euxo pipefail
+          test -f "$GITHUB_WORKSPACE/external/dia/archive.zip"
+          mkdir -p "$GITHUB_WORKSPACE/external/dia/unpacked"
+          unzip -q "$GITHUB_WORKSPACE/external/dia/archive.zip" -d "$GITHUB_WORKSPACE/external/dia/unpacked"
+          match=$(find "$GITHUB_WORKSPACE/external/dia/unpacked" -type d -name "DIA SDK" | head -n1)
+          test -n "$match"
+          rm -rf "$GITHUB_WORKSPACE/external/dia/DIA SDK"
+          cp -R "$match" "$GITHUB_WORKSPACE/external/dia/DIA SDK"
+          test -f "$GITHUB_WORKSPACE/external/dia/DIA SDK/include/dia2.h"
+          test -f "$GITHUB_WORKSPACE/external/dia/DIA SDK/lib/amd64/diaguids.lib"
+
+      - name: Build native tablegen tools
+        run: |
+          set -euxo pipefail
+          cmake -S llvm -B build-host -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_TARGETS_TO_BUILD="X86" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_BINDINGS=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF
+          cmake --build build-host --parallel --target llvm-tblgen clang-tblgen
+
+      - name: Configure mingw Windows x64 SDK build
+        run: |
+          set -euxo pipefail
+          MINGW_SYSROOT="$(x86_64-w64-mingw32-gcc -print-sysroot)"
+          cmake -S llvm -B build-sdk -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_RC_COMPILER=${TARGET_TRIPLE}-windres \
+            -DCMAKE_C_COMPILER_TARGET=${TARGET_TRIPLE} \
+            -DCMAKE_CXX_COMPILER_TARGET=${TARGET_TRIPLE} \
+            -DCMAKE_C_FLAGS="--sysroot=${MINGW_SYSROOT}" \
+            -DCMAKE_CXX_FLAGS="--sysroot=${MINGW_SYSROOT}" \
+            -DCMAKE_FIND_ROOT_PATH="${MINGW_SYSROOT}" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY \
+            -DLLVM_HOST_TRIPLE=${TARGET_TRIPLE} \
+            -DLLVM_NATIVE_TOOL_DIR="$GITHUB_WORKSPACE/build-host/bin" \
+            -DLLVM_USE_LINKER=lld \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="X86" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_BINDINGS=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_BUILD_LLVM_DYLIB=OFF \
+            -DLLVM_LINK_LLVM_DYLIB=OFF \
+            -DLLVM_INSTALL_TOOLCHAIN_ONLY=OFF \
+            -DLLVM_ENABLE_DIA_SDK=ON \
+            -DLLVM_DIA_SDK_ROOT="$GITHUB_WORKSPACE/external/dia/DIA SDK"
+
+      - name: Build and install SDK
+        run: |
+          set -euxo pipefail
+          cmake --build build-sdk --parallel
+          cmake --install build-sdk --prefix "$GITHUB_WORKSPACE/install/${SDK_DIR_NAME}"
+
+      - name: Validate SDK contents
+        run: |
+          set -euxo pipefail
+          SDK_ROOT="$GITHUB_WORKSPACE/install/${SDK_DIR_NAME}"
+          test -f "$SDK_ROOT/include/llvm/DebugInfo/PDB/PDB.h"
+          test -f "$SDK_ROOT/lib/cmake/llvm/LLVMConfig.cmake"
+          test -f "$SDK_ROOT/bin/llvm-pdbutil.exe"
+          test -f "$SDK_ROOT/lib/libLLVMDebugInfoPDB.a"
+          ${TARGET_TRIPLE}-objdump -f "$SDK_ROOT/bin/llvm-pdbutil.exe" | grep -q "pei-x86-64"
+          if ${TARGET_TRIPLE}-strings "$SDK_ROOT/lib/libLLVMDebugInfoPDB.a" | grep -qi 'atls\\.lib'; then
+            echo "Unexpected ATL dependency detected"
+            exit 1
+          fi
+
+      - name: Probe SDK with find_package(LLVM)
+        run: |
+          set -euxo pipefail
+          mkdir -p probe
+          cat > probe/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(llvm_pdb_sdk_probe CXX)
+          find_package(LLVM REQUIRED CONFIG PATHS "${CMAKE_SOURCE_DIR}/../install/llvm-sdk-mingw-x86_64-windows/lib/cmake/llvm" NO_DEFAULT_PATH)
+          add_executable(llvm_pdb_sdk_probe main.cpp)
+          target_include_directories(llvm_pdb_sdk_probe PRIVATE ${LLVM_INCLUDE_DIRS})
+          target_compile_definitions(llvm_pdb_sdk_probe PRIVATE ${LLVM_DEFINITIONS})
+          target_link_libraries(llvm_pdb_sdk_probe PRIVATE LLVMDebugInfoPDB LLVMSupport LLVMObject)
+          EOF
+          cat > probe/main.cpp <<'EOF'
+          #include "llvm/DebugInfo/PDB/PDB.h"
+          int main() { return 0; }
+          EOF
+          MINGW_SYSROOT="$(x86_64-w64-mingw32-gcc -print-sysroot)"
+          cmake -S probe -B probe-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CXX_COMPILER_TARGET=${TARGET_TRIPLE} \
+            -DCMAKE_CXX_FLAGS="--sysroot=${MINGW_SYSROOT}" \
+            -DCMAKE_FIND_ROOT_PATH="${MINGW_SYSROOT}" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
+          cmake --build probe-build --parallel
+
+      - name: Package SDK
+        run: |
+          set -euxo pipefail
+          cd install
+          zip -r "$GITHUB_WORKSPACE/${SDK_DIR_NAME}.zip" "${SDK_DIR_NAME}"
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-sdk-mingw-x86_64-windows
+          path: |
+            ${{ github.workspace }}/${{ env.SDK_DIR_NAME }}.zip
+
+
+

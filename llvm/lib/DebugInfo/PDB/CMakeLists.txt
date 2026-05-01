@@ -5,16 +5,30 @@ endmacro()
 
 if(LLVM_ENABLE_DIA_SDK)
   include_directories(SYSTEM ${MSVC_DIA_SDK_DIR}/include)
-  set(LIBPDB_LINK_FOLDERS "${MSVC_DIA_SDK_DIR}\\lib")
+  set(LIBPDB_LINK_FOLDERS "${MSVC_DIA_SDK_DIR}/lib")
 
-  if ("$ENV{VSCMD_ARG_TGT_ARCH}" STREQUAL "arm64")
-    set(LIBPDB_LINK_FOLDERS "${LIBPDB_LINK_FOLDERS}\\arm64")
-  elseif ("$ENV{VSCMD_ARG_TGT_ARCH}" STREQUAL "arm")
-    set(LIBPDB_LINK_FOLDERS "${LIBPDB_LINK_FOLDERS}\\arm")
-  elseif (CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(LIBPDB_LINK_FOLDERS "${LIBPDB_LINK_FOLDERS}\\amd64")
+  if ("$ENV{VSCMD_ARG_TGT_ARCH}" STREQUAL "arm64" OR
+      LLVM_HOST_TRIPLE MATCHES "^aarch64-.*windows" OR
+      CMAKE_C_COMPILER_TARGET MATCHES "^aarch64-.*windows")
+    set(LIBPDB_LINK_FOLDERS "${LIBPDB_LINK_FOLDERS}/arm64")
+  elseif ("$ENV{VSCMD_ARG_TGT_ARCH}" STREQUAL "arm" OR
+          LLVM_HOST_TRIPLE MATCHES "^armv?7?-.*windows" OR
+          CMAKE_C_COMPILER_TARGET MATCHES "^armv?7?-.*windows")
+    set(LIBPDB_LINK_FOLDERS "${LIBPDB_LINK_FOLDERS}/arm")
+  elseif ("$ENV{VSCMD_ARG_TGT_ARCH}" STREQUAL "x64" OR
+          LLVM_HOST_TRIPLE MATCHES "^x86_64-.*windows" OR
+          CMAKE_C_COMPILER_TARGET MATCHES "^x86_64-.*windows" OR
+          CMAKE_SIZEOF_VOID_P EQUAL 8)
+    if (EXISTS "${LIBPDB_LINK_FOLDERS}/amd64/diaguids.lib")
+      set(LIBPDB_LINK_FOLDERS "${LIBPDB_LINK_FOLDERS}/amd64")
+    endif()
   endif()
-  file(TO_CMAKE_PATH "${LIBPDB_LINK_FOLDERS}\\diaguids.lib" LIBPDB_ADDITIONAL_LIBRARIES)
+
+  if (NOT EXISTS "${LIBPDB_LINK_FOLDERS}/diaguids.lib")
+    message(FATAL_ERROR "diaguids.lib not found under ${MSVC_DIA_SDK_DIR}. Set LLVM_DIA_SDK_ROOT to a valid DIA SDK.")
+  endif()
+
+  file(TO_CMAKE_PATH "${LIBPDB_LINK_FOLDERS}/diaguids.lib" LIBPDB_ADDITIONAL_LIBRARIES)
 
   add_pdb_impl_folder(DIA
     DIA/DIADataStream.cpp

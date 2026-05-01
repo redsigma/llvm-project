@@ -68,18 +68,15 @@ static Error LoadDIA(CComPtr<IDiaDataSource> &DiaDataSource) {
                                  reinterpret_cast<LPVOID *>(&DiaDataSource))))
     return Error::success();
 
-// If the CoCreateInstance call above failed, msdia*.dll is not registered.
-// Try loading the DLL corresponding to the #included DIA SDK.
-#if !defined(_MSC_VER)
-  return llvm::make_error<PDBError>(pdb_error_code::dia_failed_loading);
-#else
+  // If the CoCreateInstance call above failed, msdia*.dll is not registered.
+  // Try loading the DLL corresponding to the included DIA SDK from the local
+  // DLL search path, which allows consumers to ship it beside the executable.
   const wchar_t *msdia_dll = L"msdia140.dll";
   HRESULT HR;
   if (FAILED(HR = NoRegCoCreate(msdia_dll, CLSID_DiaSource, IID_IDiaDataSource,
                                 reinterpret_cast<LPVOID *>(&DiaDataSource))))
     return ErrorFromHResult(HR, "Calling NoRegCoCreate");
   return Error::success();
-#endif
 }
 
 DIASession::DIASession(CComPtr<IDiaSession> DiaSession) : Session(DiaSession) {}
@@ -284,9 +281,13 @@ DIASession::findSourceFiles(const PDBSymbolCompiland *Compiland,
                             llvm::StringRef Pattern,
                             PDB_NameSearchFlags Flags) const {
   IDiaSymbol *DiaCompiland = nullptr;
-  CComBSTR Utf16Pattern;
-  if (!Pattern.empty())
-    Utf16Pattern = CComBSTR(Pattern.data());
+  llvm::SmallVector<UTF16, 128> Utf16Pattern;
+  const wchar_t *Utf16PatternPtr = nullptr;
+  if (!Pattern.empty()) {
+    if (!llvm::convertUTF8ToUTF16String(Pattern, Utf16Pattern))
+      return nullptr;
+    Utf16PatternPtr = reinterpret_cast<const wchar_t *>(Utf16Pattern.data());
+  }
 
   if (Compiland)
     DiaCompiland = static_cast<const DIARawSymbol &>(Compiland->getRawSymbol())
@@ -296,7 +297,7 @@ DIASession::findSourceFiles(const PDBSymbolCompiland *Compiland,
       Flags | PDB_NameSearchFlags::NS_FileNameExtMatch);
   CComPtr<IDiaEnumSourceFiles> SourceFiles;
   if (S_OK !=
-      Session->findFile(DiaCompiland, Utf16Pattern.m_str, Flags, &SourceFiles))
+      Session->findFile(DiaCompiland, Utf16PatternPtr, Flags, &SourceFiles))
     return nullptr;
   return std::make_unique<DIAEnumSourceFiles>(*this, SourceFiles);
 }
