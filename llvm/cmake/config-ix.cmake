@@ -625,42 +625,46 @@ if( MSVC )
   set(SHLIBEXT ".lib")
   set(stricmp "_stricmp")
   set(strdup "_strdup")
+endif()
 
-  # Allow setting clang-cl's /winsysroot flag.
+if(WIN32)
   set(LLVM_WINSYSROOT "" CACHE STRING
-    "If set, argument to clang-cl's /winsysroot")
+    "If set, path to a Windows sysroot containing a DIA SDK")
+  set(LLVM_DIA_SDK_ROOT "" CACHE PATH
+    "Path to the DIA SDK root")
 
-  if (LLVM_WINSYSROOT)
-    set(MSVC_DIA_SDK_DIR "${LLVM_WINSYSROOT}/DIA SDK" CACHE PATH
-        "Path to the DIA SDK")
-  else()
-    set(MSVC_DIA_SDK_DIR "$ENV{VSINSTALLDIR}DIA SDK" CACHE PATH
-        "Path to the DIA SDK")
+  if (NOT LLVM_DIA_SDK_ROOT)
+    if (LLVM_WINSYSROOT)
+      set(LLVM_DIA_SDK_ROOT "${LLVM_WINSYSROOT}/DIA SDK" CACHE PATH
+          "Path to the DIA SDK root" FORCE)
+    elseif (MSVC)
+      set(LLVM_DIA_SDK_ROOT "$ENV{VSINSTALLDIR}DIA SDK" CACHE PATH
+          "Path to the DIA SDK root" FORCE)
+    endif()
   endif()
 
-  # See if the DIA SDK is available and usable.
-  # Due to a bug in MSVC 2013's installation software, it is possible
-  # for MSVC 2013 to write the DIA SDK into the Visual Studio 2012
-  # install directory.  If this happens, the installation is corrupt
-  # and there's nothing we can do.  It happens with enough frequency
-  # though that we should handle it.  We do so by simply checking that
-  # the DIA SDK folder exists.  Should this happen you will need to
-  # uninstall VS 2012 and then re-install VS 2013.
-  if (IS_DIRECTORY "${MSVC_DIA_SDK_DIR}")
+  set(MSVC_DIA_SDK_DIR "${LLVM_DIA_SDK_ROOT}" CACHE PATH
+      "Path to the DIA SDK")
+
+  if (EXISTS "${MSVC_DIA_SDK_DIR}/include/dia2.h" AND
+      (EXISTS "${MSVC_DIA_SDK_DIR}/lib/amd64/diaguids.lib" OR
+       EXISTS "${MSVC_DIA_SDK_DIR}/lib/arm64/diaguids.lib" OR
+       EXISTS "${MSVC_DIA_SDK_DIR}/lib/arm/diaguids.lib" OR
+       EXISTS "${MSVC_DIA_SDK_DIR}/lib/diaguids.lib"))
     set(HAVE_DIA_SDK 1)
   else()
     set(HAVE_DIA_SDK 0)
   endif()
 
-  option(LLVM_ENABLE_DIA_SDK "Use MSVC DIA SDK for debugging if available."
+  option(LLVM_ENABLE_DIA_SDK "Use DIA SDK for debugging if available."
                              ${HAVE_DIA_SDK})
 
   if(LLVM_ENABLE_DIA_SDK AND NOT HAVE_DIA_SDK)
-    message(FATAL_ERROR "DIA SDK not found. If you have both VS 2012 and 2013 installed, you may need to uninstall the former and re-install the latter afterwards.")
+    message(FATAL_ERROR "DIA SDK not found. Set LLVM_DIA_SDK_ROOT or LLVM_WINSYSROOT to a DIA SDK containing include/dia2.h and a matching diaguids.lib.")
   endif()
 else()
   set(LLVM_ENABLE_DIA_SDK 0)
-endif( MSVC )
+endif(WIN32)
 
 if( LLVM_ENABLE_THREADS )
   # Check if threading primitives aren't supported on this platform

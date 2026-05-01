@@ -1,0 +1,220 @@
+name: Mingw Windows x64 LLVM SDK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-dia-sdk:
+    runs-on: windows-2022
+    env:
+      DIA_BOOTSTRAP_URL: https://aka.ms/vs/17/release/vs_buildtools.exe
+    steps:
+      - name: Locate DIA SDK (preinstalled or install Build Tools)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $diaRoot = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\DIA SDK'
+
+          if (-not (Test-Path "$diaRoot\include\dia2.h") -or -not (Test-Path "$diaRoot\lib\amd64\diaguids.lib")) {
+            Write-Host 'DIA SDK not found, installing Build Tools workload from internet...'
+            Invoke-WebRequest -Uri $env:DIA_BOOTSTRAP_URL -OutFile "$env:TEMP\vs_buildtools.exe"
+            Start-Process -FilePath "$env:TEMP\vs_buildtools.exe" -Wait -NoNewWindow -ArgumentList @(
+              '--quiet',
+              '--wait',
+              '--norestart',
+              '--nocache',
+              '--installPath', 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools',
+              '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+              '--includeRecommended',
+              '--remove', 'Microsoft.VisualStudio.Component.Windows10SDK.10240',
+              '--remove', 'Microsoft.VisualStudio.Component.Windows10SDK.10586',
+              '--remove', 'Microsoft.VisualStudio.Component.Windows10SDK.14393',
+              '--remove', 'Microsoft.VisualStudio.Component.Windows81SDK'
+            )
+          }
+
+          if (-not (Test-Path "$diaRoot\include\dia2.h")) { throw 'dia2.h not found after setup' }
+          if (-not (Test-Path "$diaRoot\lib\amd64\diaguids.lib")) { throw 'diaguids.lib not found after setup' }
+
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dia-payload" | Out-Null
+          Copy-Item -Recurse -Force "$diaRoot" "$env:GITHUB_WORKSPACE\dia-payload\DIA SDK"
+
+      - name: Pack DIA SDK archive
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE\dia-payload\DIA SDK" -DestinationPath "$env:GITHUB_WORKSPACE\archive.zip" -Force
+
+      - name: Upload DIA SDK archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: dia-sdk-archive
+          path: ${{ github.workspace }}/archive.zip
+
+  build-sdk:
+    runs-on: ubuntu-22.04
+    needs: fetch-dia-sdk
+    env:
+      TARGET_TRIPLE: x86_64-w64-mingw32
+      SDK_DIR_NAME: llvm-sdk-mingw-x86_64-windows
+    steps:
+      - name: Checkout LLVM
+        uses: actions/checkout@v6
+
+      - name: Download DIA SDK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dia-sdk-archive
+          path: ${{ github.workspace }}/external/dia
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            lld \
+            cmake \
+            ninja-build \
+            mingw-w64 \
+            zip \
+            unzip \
+            p7zip-full \
+            python3
+
+      - name: Prepare DIA SDK from downloaded archive
+        run: |
+          set -euxo pipefail
+          test -f "$GITHUB_WORKSPACE/external/dia/archive.zip"
+          mkdir -p "$GITHUB_WORKSPACE/external/dia/unpacked"
+          unzip -q "$GITHUB_WORKSPACE/external/dia/archive.zip" -d "$GITHUB_WORKSPACE/external/dia/unpacked"
+          match=$(find "$GITHUB_WORKSPACE/external/dia/unpacked" -type d -name "DIA SDK" | head -n1)
+          test -n "$match"
+          rm -rf "$GITHUB_WORKSPACE/external/dia/DIA SDK"
+          cp -R "$match" "$GITHUB_WORKSPACE/external/dia/DIA SDK"
+          test -f "$GITHUB_WORKSPACE/external/dia/DIA SDK/include/dia2.h"
+          test -f "$GITHUB_WORKSPACE/external/dia/DIA SDK/lib/amd64/diaguids.lib"
+
+      - name: Build native tablegen tools
+        run: |
+          set -euxo pipefail
+          cmake -S llvm -B build-host -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_TARGETS_TO_BUILD="X86" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_BINDINGS=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF
+          cmake --build build-host --parallel --target llvm-tblgen clang-tblgen
+
+      - name: Configure mingw Windows x64 SDK build
+        run: |
+          set -euxo pipefail
+          MINGW_SYSROOT="$(x86_64-w64-mingw32-gcc -print-sysroot)"
+          cmake -S llvm -B build-sdk -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_RC_COMPILER=${TARGET_TRIPLE}-windres \
+            -DCMAKE_C_COMPILER_TARGET=${TARGET_TRIPLE} \
+            -DCMAKE_CXX_COMPILER_TARGET=${TARGET_TRIPLE} \
+            -DCMAKE_C_FLAGS="--sysroot=${MINGW_SYSROOT}" \
+            -DCMAKE_CXX_FLAGS="--sysroot=${MINGW_SYSROOT}" \
+            -DCMAKE_FIND_ROOT_PATH="${MINGW_SYSROOT}" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY \
+            -DLLVM_HOST_TRIPLE=${TARGET_TRIPLE} \
+            -DLLVM_NATIVE_TOOL_DIR="$GITHUB_WORKSPACE/build-host/bin" \
+            -DLLVM_USE_LINKER=lld \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="X86" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_BINDINGS=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_BUILD_LLVM_DYLIB=OFF \
+            -DLLVM_LINK_LLVM_DYLIB=OFF \
+            -DLLVM_INSTALL_TOOLCHAIN_ONLY=OFF \
+            -DLLVM_ENABLE_DIA_SDK=ON \
+            -DLLVM_DIA_SDK_ROOT="$GITHUB_WORKSPACE/external/dia/DIA SDK"
+
+      - name: Build and install SDK
+        run: |
+          set -euxo pipefail
+          cmake --build build-sdk --parallel
+          cmake --install build-sdk --prefix "$GITHUB_WORKSPACE/install/${SDK_DIR_NAME}"
+
+      - name: Validate SDK contents
+        run: |
+          set -euxo pipefail
+          SDK_ROOT="$GITHUB_WORKSPACE/install/${SDK_DIR_NAME}"
+          test -f "$SDK_ROOT/include/llvm/DebugInfo/PDB/PDB.h"
+          test -f "$SDK_ROOT/lib/cmake/llvm/LLVMConfig.cmake"
+          test -f "$SDK_ROOT/bin/llvm-pdbutil.exe"
+          test -f "$SDK_ROOT/lib/libLLVMDebugInfoPDB.a"
+          ${TARGET_TRIPLE}-objdump -f "$SDK_ROOT/bin/llvm-pdbutil.exe" | grep -q "pei-x86-64"
+          if ${TARGET_TRIPLE}-strings "$SDK_ROOT/lib/libLLVMDebugInfoPDB.a" | grep -qi 'atls\\.lib'; then
+            echo "Unexpected ATL dependency detected"
+            exit 1
+          fi
+
+      - name: Probe SDK with find_package(LLVM)
+        run: |
+          set -euxo pipefail
+          mkdir -p probe
+          cat > probe/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(llvm_pdb_sdk_probe CXX)
+          find_package(LLVM REQUIRED CONFIG PATHS "${CMAKE_SOURCE_DIR}/../install/llvm-sdk-mingw-x86_64-windows/lib/cmake/llvm" NO_DEFAULT_PATH)
+          add_executable(llvm_pdb_sdk_probe main.cpp)
+          target_include_directories(llvm_pdb_sdk_probe PRIVATE ${LLVM_INCLUDE_DIRS})
+          target_compile_definitions(llvm_pdb_sdk_probe PRIVATE ${LLVM_DEFINITIONS})
+          target_link_libraries(llvm_pdb_sdk_probe PRIVATE LLVMDebugInfoPDB LLVMSupport LLVMObject)
+          EOF
+          cat > probe/main.cpp <<'EOF'
+          #include "llvm/DebugInfo/PDB/PDB.h"
+          int main() { return 0; }
+          EOF
+          MINGW_SYSROOT="$(x86_64-w64-mingw32-gcc -print-sysroot)"
+          cmake -S probe -B probe-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CXX_COMPILER_TARGET=${TARGET_TRIPLE} \
+            -DCMAKE_CXX_FLAGS="--sysroot=${MINGW_SYSROOT}" \
+            -DCMAKE_FIND_ROOT_PATH="${MINGW_SYSROOT}" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
+          cmake --build probe-build --parallel
+
+      - name: Package SDK
+        run: |
+          set -euxo pipefail
+          cd install
+          zip -r "$GITHUB_WORKSPACE/${SDK_DIR_NAME}.zip" "${SDK_DIR_NAME}"
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-sdk-mingw-x86_64-windows
+          path: |
+            ${{ github.workspace }}/${{ env.SDK_DIR_NAME }}.zip
